@@ -1,0 +1,2042 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo, Suspense, lazy } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { brandTokens, BrandKey } from '../theme/tokens';
+import CommandPalette, { Command } from './CommandPalette';
+// import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { 
+  Brain, Settings, CheckCircle2, Play, Target, 
+  TrendingUp, Activity, Database, Network, Shield, Clock, 
+  Sun, Wind, Thermometer, Droplets, MapPin
+} from 'lucide-react';
+const LazySimulator = lazy(() => import('./views/SimulatorView'))
+const LazyCampaigns = lazy(() => import('./views/CampaignsView'))
+const LazyExplorer = lazy(() => import('./views/ExplorerView'))
+const LazyPlaybooks = lazy(() => import('./views/PlaybooksView'))
+const LazyPerformance = lazy(() => import('./views/PerformanceView'))
+import ExecutiveDashboardClean from './ExecutiveDashboardClean';
+import DemoTour from './DemoTour';
+
+// ==================== TYPES & INTERFACES ====================
+
+interface Weather {
+  current: {
+    timestamp: Date;
+    temperature: number;
+    feelsLike: number;
+    humidity: number;
+    pressure: number;
+    windSpeed: number;
+    windDirection: number;
+    uvIndex: number;
+    precipitation: number;
+    conditions: string;
+    description: string;
+    location: { city: string; lat: number; lng: number };
+  };
+  scientific: {
+    temperatureC: number;
+    heatIndex: number;
+    windChill: number;
+    comfortIndex: number;
+    weatherScore: number;
+  };
+  meta: {
+    source: string;
+    durationMs: number;
+    requestId: string;
+  };
+}
+
+interface Prediction {
+  category: string;
+  products: string[];
+  action: string;
+  budgetMultiplier: number;
+  expectedLift: string;
+  confidence: number;
+  reasoning: string;
+  timestamp: Date;
+  aiModel: string;
+  features: number[];
+  ucbScore: number;
+}
+
+interface Brand {
+  name: string;
+  description: string;
+  logo: string;
+  location: { city: string; lat: number; lng: number };
+  colors: { primary: string; accent: string };
+  products: {
+    total: number;
+    categories: Record<string, string[]>;
+  };
+  monthlyRevenue: number;
+  avgOrderValue: number;
+  conversionRate: number;
+}
+
+interface PromoSignal {
+  id: string;
+  type: 'sitewide'|'category'|'sku'|'email'|'sms'|'loyalty'|'other';
+  source: 'klaviyo'|'custom';
+  discountPct?: number;
+  categoryKeys?: string[];
+  startsAt: string;
+  endsAt: string;
+  intensity?: number;
+}
+
+interface CampaignSignal {
+  id: string;
+  channels: ('meta'|'google'|'tt'|'email')[];
+  regions?: string[];
+  budgetWeight?: number;
+  categoryTags?: string[];
+  startsAt: string;
+  endsAt: string;
+}
+
+// ==== PATCH A: AD SPEND & SIMULATOR TYPES ====
+interface SpendRecord {
+  date: string;
+  byCategory: Record<string, number>;
+}
+
+interface ScenarioState {
+  tempAdj: number;
+  precipAdj: number;
+  promoAdj: number;
+  campaignAdj: number;
+  adSpendAdj: number;
+}
+
+// BrandKey imported from tokens.ts
+
+// ==================== SMART PREDICTION ENGINE ====================
+
+const mulberry32 = (seed: number) => {
+  let t = seed;
+  return () => {
+    t |= 0;
+    t = t + 0x6D2B79F5 | 0;
+    let imul = Math.imul(t ^ t >>> 15, t | 1);
+    imul = Math.imul(imul ^ imul >>> 7, imul | 61);
+    return ((imul ^ imul >>> 14) >>> 0) / 4294967296;
+  };
+};
+
+// ==== PATCH 5: LINUCB MATH (GENERAL SOLVER) + GUARDRAILS ====
+const gaussianSolve = (A: number[][], y: number[]) => {
+  const n = A.length;
+  const M = A.map((r, i) => [...r, y[i]]);
+  for (let i = 0; i < n; i++) {
+    let max = i;
+    for (let r = i + 1; r < n; r++) {
+      if (Math.abs(M[r][i]) > Math.abs(M[max][i])) max = r;
+    }
+    [M[i], M[max]] = [M[max], M[i]];
+    const div = M[i][i] || 1e-8;
+    for (let j = i; j <= n; j++) M[i][j] /= div;
+    for (let r = 0; r < n; r++) {
+      if (r === i) continue;
+      const f = M[r][i];
+      for (let j = i; j <= n; j++) M[r][j] -= f * M[i][j];
+    }
+  }
+  return M.map(r => r[n]);
+};
+
+// Namespace bandit state by brand+category+month to avoid bleed
+const banditKey = (brandKey: BrandKey, category: string, isoDate?: string | null) => {
+  const d = isoDate ? new Date(isoDate) : new Date();
+  return `${brandKey}::${category}::${d.getFullYear()}-${d.getMonth()+1}`;
+};
+
+const banditState: Record<string, { A: number[][]; b: number[]; rewards: number[] }> = {};
+
+const initBandit = (key: string, dim: number, lambda = 5) => {
+  if (!banditState[key]) {
+    const I = Array.from({length: dim}, (_, i) => Array.from({length: dim}, (_, j) => i === j ? lambda : 0));
+    banditState[key] = { A: I, b: Array(dim).fill(0), rewards: [] };
+  }
+};
+
+const computeUCB = (key: string, x: number[], alpha = 0.6) => {
+  const { A, b } = banditState[key];
+  const theta = gaussianSolve(A, b);
+  const Ainvx = gaussianSolve(A, x);
+  const mean = x.reduce((s, v, i) => s + v * (theta[i] || 0), 0);
+  let width = Math.sqrt(Math.max(0, x.reduce((s, v, i) => s + v * (Ainvx[i] || 0), 0)));
+  width = Math.min(width, 2.0); // hard cap for demo stability
+  const ucb = mean + alpha * width;
+  const confidence = Math.max(0.55, Math.min(0.95, 1 - 0.8 * width));
+  return { expectedReward: mean, uncertainty: width, ucb, confidence };
+};
+
+const updateBandit = (key: string, x: number[], r: number) => {
+  const s = banditState[key];
+  for (let i = 0; i < x.length; i++) {
+    for (let j = 0; j < x.length; j++) {
+      s.A[i][j] += x[i] * x[j];
+    }
+    s.b[i] += x[i] * r;
+  }
+  s.rewards.push(r);
+  if (s.rewards.length > 100) s.rewards.shift();
+};
+
+// Realistic seasonal logic with proper temperature thresholds
+const getSeasonalMultiplier = (brandKey: 'norsari'|'patagonia'|'kingsford', category: string, tempF: number, precip: number, comfort: number): number => {
+  switch (brandKey) {
+    case 'norsari': // Winter-focused brand
+      if (category === 'winter') {
+        if (tempF < 30) return 3.2; // Extreme cold = huge boost
+        if (tempF < 45) return 2.4; // Cold = strong boost  
+        if (tempF < 60) return 1.6; // Cool = moderate boost
+        if (tempF < 75) return 0.8; // Mild = slight reduction
+        return 0.2; // Hot = major reduction
+      }
+      if (category === 'outdoor') {
+        if (tempF < 50 && comfort > 0.4) return 1.8; // Cold but comfortable
+        if (tempF > 80) return 0.3; // Too hot for heavy wraps
+        return 1.0;
+      }
+      return tempF < 70 ? 1.2 : 0.4; // Rain gear better when not hot
+      
+    case 'patagonia': // Multi-season outdoor
+      if (category === 'winter') {
+        if (tempF < 35) return 2.8;
+        if (tempF < 50) return 2.1;
+        if (tempF < 65) return 1.4;
+        return 0.6;
+      }
+      if (category === 'summer') {
+        if (tempF > 75) return 2.2;
+        if (tempF > 65) return 1.7;
+        if (tempF > 55) return 1.3;
+        return 0.7;
+      }
+      if (category === 'rain') {
+        return precip > 0.3 ? 2.5 : (precip > 0.1 ? 1.8 : 0.9);
+      }
+      return comfort > 0.6 ? 1.6 : 1.0; // Outdoor gear
+      
+    case 'kingsford': // Grilling weather dependent
+      if (category === 'summer') {
+        if (tempF > 75 && precip < 0.1) return 2.8; // Perfect grilling
+        if (tempF > 65 && precip < 0.2) return 2.0; // Good grilling
+        if (tempF > 55) return 1.2; // Possible grilling
+        if (tempF < 45) return 0.2; // Too cold
+        return precip > 0.2 ? 0.3 : 0.8; // Rain kills grilling
+      }
+      if (category === 'outdoor') {
+        return (tempF > 60 && precip < 0.3) ? 1.5 : 0.6;
+      }
+      return 0.1; // Other categories don't make sense for Kingsford
+      
+    case 'canopy': // Humidity and air quality dependent
+      if (category === 'winter') {
+        // Winter = heating season = dry air
+        if (tempF < 40) return 2.5; // Very cold, very dry
+        if (tempF < 50) return 2.0; // Cold, dry
+        if (tempF < 65) return 1.5; // Cool season
+        return 0.8; // Warmer = less heating = less dry
+      }
+      if (category === 'summer') {
+        // Hot weather increases AC use = dry air
+        if (tempF > 80) return 1.8;
+        if (tempF > 70) return 1.4;
+        return 0.9;
+      }
+      if (category === 'indoor') {
+        // Year-round air quality needs
+        return 1.2 + (precip > 0.1 ? 0.3 : 0); // Rain reduces outdoor air quality
+      }
+      if (category === 'wellness') {
+        // Sleep and wellness affected by comfort
+        return comfort > 0.6 ? 1.4 : 1.0;
+      }
+      return 1.0;
+      
+    default:
+      return 1.0;
+  }
+};
+
+// Only allow categories that make sense for each brand
+const allowByBrand = (brandKey: BrandKey, category: string) => {
+  switch (brandKey) {
+    case 'norsari':
+      return ['winter', 'outdoor', 'rain'].includes(category);
+    case 'patagonia':
+      return ['winter', 'summer', 'rain', 'outdoor'].includes(category);
+    case 'kingsford':
+      return ['summer', 'outdoor'].includes(category);
+    case 'canopy':
+      return ['winter', 'summer', 'indoor', 'wellness'].includes(category);
+    default:
+      return true;
+  }
+};
+
+const promoGuard = (promoActive: number, promoStrength: number, campaignStrength: number) => {
+  const combined = promoStrength * 0.7 + campaignStrength * 0.3;
+  if (promoActive && combined > 0.6) return { ucbThreshold: 0.35, dampenLift: 0.82 };
+  if (promoActive || campaignStrength > 0.2) return { ucbThreshold: 0.28, dampenLift: 0.9 };
+  return { ucbThreshold: 0.22, dampenLift: 1.0 };
+};
+
+// ==== PATCH F: AD SPEND FEATURES ====
+const normalize = (v: number, lo: number, hi: number) => Math.max(0, Math.min(1, (v - lo) / (hi - lo)));
+
+const getSpendFeatures = (brandKey: BrandKey, category: string, isoDate: string | null, hist: Record<BrandKey, SpendRecord[]>) => {
+  const day = (isoDate ? new Date(isoDate) : new Date()).toISOString().slice(0,10);
+  const records = hist[brandKey] || [];
+  const todayRec = records.find(r => r.date === day) || records[records.length-1];
+  const todaySpend = todayRec?.byCategory?.[category] ?? 0;
+  const idx = records.findIndex(r => r.date === day);
+  const end = idx>=0 ? idx : records.length-1;
+  const start = Math.max(0, end-6);
+  const last7 = records.slice(start, end+1);
+  const last7Spend = last7.reduce((s,r)=> s + (r.byCategory?.[category] ?? 0), 0);
+  // Percentile-based normalization per brand/category (robust to scale)
+  const series = records.map(r => r.byCategory?.[category] ?? 0);
+  const pct = (arr: number[], v: number) => arr.length ? (arr.filter(x => x <= v).length / arr.length) : 0;
+  const avg7 = last7.length ? last7Spend / last7.length : 0;
+  const todayNorm = pct(series, todaySpend);
+  const last7Norm = pct(series, avg7);
+  return { todayNorm, last7Norm };
+};
+
+const extractFeatures = (
+  weather: Weather,
+  promosNow: PromoSignal[],
+  campaignsNow: CampaignSignal[],
+  category: string,
+  brandKey: BrandKey,
+  isoDate: string | null,
+  hist: Record<BrandKey, SpendRecord[]>,
+  scen: ScenarioState
+): number[] => {
+  const { current, scientific } = weather;
+  const now = current.timestamp instanceof Date ? current.timestamp : new Date(current.timestamp);
+  const isWeekend = [0, 6].includes(now.getDay()) ? 1 : 0;
+
+  const activePromo = promosNow.some(p => now >= new Date(p.startsAt) && now <= new Date(p.endsAt));
+  const promoStrength = Math.min(1, promosNow.reduce((s, p) => {
+    if (now >= new Date(p.startsAt) && now <= new Date(p.endsAt)) {
+      return s + (p.intensity ?? 0.5) + ((p.discountPct || 0) / 100);
+    }
+    return s;
+  }, 0));
+
+  const activeCampaign = campaignsNow.some(c => now >= new Date(c.startsAt) && now <= new Date(c.endsAt));
+  const campaignStrength = Math.min(1, campaignsNow.reduce((s, c) => {
+    if (now >= new Date(c.startsAt) && now <= new Date(c.endsAt)) {
+      return s + (c.budgetWeight ?? 0.5);
+    }
+    return s;
+  }, 0));
+
+  const baseFeatures = [
+    normalize(current.temperature, 10, 90),
+    current.precipitation > 0.05 ? 1 : 0,
+    normalize(current.windSpeed, 0, 30),
+    normalize(current.humidity, 0, 100),
+    normalize(current.uvIndex, 0, 11),
+    normalize(scientific.comfortIndex, 0, 100),
+    normalize(scientific.weatherScore, 0, 100),
+    isWeekend,
+    activePromo ? 1 : 0,
+    promoStrength,
+    activeCampaign ? 1 : 0,
+    campaignStrength
+  ];
+
+  const { todayNorm, last7Norm } = getSpendFeatures(brandKey, category, isoDate, hist);
+  const adjustedToday = Math.max(0, Math.min(1, todayNorm * (1 + scen.adSpendAdj * 0.5)));
+  
+  return [...baseFeatures, adjustedToday, last7Norm];
+};
+
+// ==================== MAIN COMPONENT ====================
+
+const WeatherIntelligencePlatform: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [currentView, setCurrentView] = useState<string>('landing');
+  const [platformMode, setPlatformMode] = useState<string | null>(null);
+  const [selectedBrand, setSelectedBrand] = useState<string>('norsari');
+  const [isInitializing, setIsInitializing] = useState<boolean>(false);
+  const [initializationStep, setInitializationStep] = useState<string>('');
+
+  // ==== PATCH B: DEMO CALENDAR, AD SPEND HISTORY, SCENARIO STATE ====
+  const [simCalendar, setSimCalendar] = useState<Record<BrandKey, string[]>>({
+    norsari: [], patagonia: [], kingsford: [], canopy: []
+  });
+  const [selectedSimDate, setSelectedSimDate] = useState<string | null>(null);
+  const [adSpendHistory, setAdSpendHistory] = useState<Record<BrandKey, SpendRecord[]>>({
+    norsari: [], patagonia: [], kingsford: [], canopy: []
+  });
+  const [scenario, setScenario] = useState<ScenarioState>({
+    tempAdj: 0, precipAdj: -1, promoAdj: 0, campaignAdj: 0, adSpendAdj: 0
+  });
+
+  const [promos, setPromos] = useState<PromoSignal[]>([]);
+  const [campaigns, setCampaigns] = useState<CampaignSignal[]>([]);
+  const [automationEnabled, setAutomationEnabled] = useState<boolean>(true);
+  const [automationLog, setAutomationLog] = useState<Array<{time: string; msg: string}>>([]);
+  const [showDemoTour, setShowDemoTour] = useState<boolean>(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // ==== PATCH 0: REAL DEMO BRANDS ====
+  const demoBrands: Record<string, Brand> = useMemo(() => ({
+    norsari: {
+      name: 'NorSari',
+      description: 'The wearable blanket — wool-blend wraps',
+      logo: '🧣',
+      location: { city: 'Northfield, MN', lat: 44.4583, lng: -93.1616 },
+      colors: { primary: 'from-sky-700 to-indigo-700', accent: 'sky' },
+      products: {
+        total: 120,
+        categories: {
+          winter: ['Wool Wraps','Weatherproof Wraps','Heavyweight Wraps'],
+          rain:   ['Weatherproof Wraps'],
+          summer: [],
+          outdoor:['Travel Wraps','Lightweight Wraps']
+        }
+      },
+      monthlyRevenue: 180000,
+      avgOrderValue: 160,
+      conversionRate: 2.8
+    },
+    patagonia: {
+      name: 'Patagonia',
+      description: 'Outdoor clothing & gear (fleece, insulation, rain)',
+      logo: '🧗',
+      location: { city: 'Ventura, CA', lat: 34.275, lng: -119.231 },
+      colors: { primary: 'from-slate-800 to-cyan-700', accent: 'cyan' },
+      products: {
+        total: 1500,
+        categories: {
+          winter: ['Insulated Jackets','Down Sweaters','Thermal Layers'],
+          rain:   ['Rain Jackets','Storm Shells'],
+          summer: ['Trail Shirts','Shorts','Capilene®'],
+          outdoor:['Fleece Jackets','Vests','Hiking Packs']
+        }
+      },
+      monthlyRevenue: 3200000,
+      avgOrderValue: 140,
+      conversionRate: 2.3
+    },
+    kingsford: {
+      name: 'Kingsford',
+      description: 'Charcoal, hardwood pellets, flavor boosters',
+      logo: '🔥',
+      location: { city: 'Louisville, KY', lat: 38.2527, lng: -85.7585 },
+      colors: { primary: 'from-orange-600 to-red-700', accent: 'orange' },
+      products: {
+        total: 80,
+        categories: {
+          summer: ['Charcoal Briquets','Hardwood Pellets','Flavor Boosters'],
+          outdoor:['Lighter Fluid','Chimney Starters','Grill Accessories'],
+          rain:   [],
+          winter: []
+        }
+      },
+      monthlyRevenue: 2400000,
+      avgOrderValue: 25,
+      conversionRate: 3.8
+    },
+    canopy: {
+      name: 'Canopy',
+      description: 'Smart humidifiers & air quality products',
+      logo: '💧',
+      location: { city: 'New York, NY', lat: 40.7128, lng: -74.0060 },
+      colors: { primary: 'from-emerald-600 to-green-700', accent: 'emerald' },
+      products: {
+        total: 45,
+        categories: {
+          winter: ['Large Room Humidifier','Bedroom Humidifier','Essential Oil Diffusers'],
+          summer: ['Cooling Mist Humidifier','Portable Humidifier'],
+          indoor: ['Smart Air Purifier','Aroma Diffuser','Replacement Filters'],
+          wellness: ['Sleep Enhancement Bundle','Aromatherapy Collection','Hydration Monitoring']
+        }
+      },
+      monthlyRevenue: 850000,
+      avgOrderValue: 180,
+      conversionRate: 4.2
+    }
+  }), []);
+
+  const [liveData, setLiveData] = useState<{
+    weather: Weather | null;
+    predictions: Prediction[];
+    lastUpdated: Date | null;
+    isLoading: boolean;
+    errors: string[];
+  }>({
+    weather: null,
+    predictions: [],
+    lastUpdated: null,
+    isLoading: false,
+    errors: []
+  });
+
+  const [demoMetrics, setDemoMetrics] = useState({
+    predictionsPerSecond: 2847,
+    connectedBrands: 47,
+    aiAccuracy: 94.7,
+    dataPointsProcessed: 15847293
+  });
+
+  const [notifications, setNotifications] = useState<Array<{
+    id: number;
+    message: string;
+    type: 'success' | 'error' | 'info';
+    timestamp: Date;
+    dismissed: boolean;
+  }>>([]);
+
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const notificationTimeouts = useRef<Map<number, NodeJS.Timeout>>(new Map());
+
+  // ==== PATCH C: RNG SEED (brand + month from selected date or today) ====
+  const rng = useMemo(() => {
+    const baseDate = selectedSimDate ? new Date(selectedSimDate) : new Date();
+    const base = `${selectedBrand}:${baseDate.getFullYear()}-${baseDate.getMonth()+1}`;
+    const seed = base.split('').reduce((a,c)=> (Math.imul(31,a) + c.charCodeAt(0))|0, 0) >>> 0;
+    return mulberry32(seed);
+  }, [selectedBrand, selectedSimDate]);
+
+  // Route syncing (simple mapping). We render based on path for code-splitting friendliness.
+  const pathToView = (path: string) => {
+    if (path.startsWith('/brands')) return 'brandSelection';
+    if (path.startsWith('/dashboard')) return 'dashboard';
+    if (path.startsWith('/simulator')) return 'simulator';
+    if (path.startsWith('/campaigns')) return 'campaigns';
+    if (path.startsWith('/explorer')) return 'explorer';
+    if (path.startsWith('/playbooks')) return 'playbooks';
+    if (path.startsWith('/performance')) return 'performance';
+    return 'landing';
+  };
+  const viewToPath = (view: string) => {
+    switch(view){
+      case 'brandSelection': return '/brands';
+      case 'dashboard': return '/dashboard';
+      case 'simulator': return '/simulator';
+      case 'campaigns': return '/campaigns';
+      case 'explorer': return '/explorer';
+      case 'playbooks': return '/playbooks';
+      case 'performance': return '/performance';
+      default: return '/';
+    }
+  };
+  useEffect(()=>{
+    const v = pathToView(location.pathname);
+    if (v !== currentView) setCurrentView(v);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.pathname]);
+  const go = (view: string) => {
+    setCurrentView(view);
+    navigate(viewToPath(view));
+  };
+
+  const cityBaselines = useMemo(() => ({
+    'Northfield, MN': { tempF: [15, 22, 35, 50, 63, 72, 77, 75, 66, 52, 35, 20], precipProb: [0.15, 0.15, 0.18, 0.22, 0.25, 0.35, 0.40, 0.35, 0.25, 0.20, 0.18, 0.15] },
+    'Ventura, CA': { tempF: [58, 60, 62, 65, 68, 71, 74, 75, 73, 69, 63, 59], precipProb: [0.25, 0.30, 0.20, 0.10, 0.05, 0.02, 0.01, 0.02, 0.05, 0.15, 0.20, 0.25] },
+    'Louisville, KY': { tempF: [35, 40, 50, 60, 70, 78, 82, 81, 74, 62, 50, 40], precipProb: [0.30, 0.30, 0.35, 0.35, 0.40, 0.35, 0.30, 0.25, 0.25, 0.25, 0.30, 0.30] },
+    'New York, NY': { tempF: [32, 35, 43, 54, 64, 73, 78, 76, 69, 58, 47, 37], precipProb: [0.25, 0.25, 0.28, 0.32, 0.35, 0.35, 0.32, 0.30, 0.28, 0.25, 0.28, 0.25] }
+  }), []);
+
+  // ==== PATCH D: BUILD CALENDAR & SPEND HISTORY ====
+  const buildSimCalendar = useCallback((brandKey: BrandKey) => {
+    const year = new Date().getFullYear();
+    const days: string[] = [];
+    for (let m=0;m<12;m++){
+      const day = 1 + Math.floor(mulberry32(Math.imul(37, (m+1) + brandKey.length))()*20);
+      const d = new Date(year, m, Math.max(1, Math.min(28, day)));
+      days.push(d.toISOString().slice(0,10));
+    }
+    return days;
+  }, []);
+
+  const buildAdSpendHistory = useCallback((brandKey: BrandKey, categories: string[]) => {
+    const out: SpendRecord[] = [];
+    const today = new Date();
+    for (let i=29; i>=0; i--){
+      const d = new Date(today);
+      d.setDate(today.getDate()-i);
+      const byCategory: Record<string, number> = {};
+      categories.forEach((c, idx) => {
+        const base = 100 + (idx*40);
+        const seasonal = 1 + 0.2*Math.sin((d.getMonth()-1)*Math.PI/6);
+        const noise = 0.7 + mulberry32(i*17 + brandKey.length)()*0.6;
+        byCategory[c] = Math.round(base*seasonal*noise);
+      });
+      out.push({ date: d.toISOString().slice(0,10), byCategory });
+    }
+    return out;
+  }, []);
+
+  // ==== Init calendar & spend history in two stages to avoid race ====
+  useEffect(() => {
+    const key = selectedBrand as BrandKey;
+    if (!simCalendar[key]?.length) {
+      setSimCalendar(prev => ({ ...prev, [key]: buildSimCalendar(key) }));
+    }
+    if (!adSpendHistory[key]?.length) {
+      const cats = Object.keys(demoBrands[selectedBrand].products.categories);
+      setAdSpendHistory(prev => ({ ...prev, [key]: buildAdSpendHistory(key, cats) }));
+    }
+  }, [selectedBrand, buildSimCalendar, buildAdSpendHistory, demoBrands, simCalendar, adSpendHistory]);
+
+  useEffect(() => {
+    const key = selectedBrand as BrandKey;
+    const days = simCalendar[key];
+    if (!selectedSimDate && days?.length) {
+      setSelectedSimDate(days[new Date().getMonth()]);
+    }
+  }, [selectedBrand, simCalendar, selectedSimDate]);
+
+  // Ensure initial pipeline run once sources are ready
+  useEffect(() => {
+    if (platformMode !== 'demo') return;
+    const key = selectedBrand as BrandKey;
+    const calReady = (simCalendar[key] || []).length > 0;
+    const spendReady = (adSpendHistory[key] || []).length > 0;
+    if (calReady && spendReady && selectedSimDate) {
+      runDemoPipeline();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platformMode, selectedBrand, selectedSimDate, simCalendar, adSpendHistory]);
+
+  // Global hotkey for command palette (Cmd/Ctrl+K)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isMac = navigator.platform.toUpperCase().includes('MAC');
+      if ((isMac && e.metaKey && e.key.toLowerCase() === 'k') || (!isMac && e.ctrlKey && e.key.toLowerCase() === 'k')) {
+        e.preventDefault();
+        setPaletteOpen(v => !v);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  // ==== PATCH E: DATE-AWARE GENERATORS ====
+  const withDate = (iso?: string | null) => iso ? new Date(iso) : new Date();
+
+  const generateSimPromosAt = useCallback((brandKey: string, isoDate: string | null, scen: ScenarioState): PromoSignal[] => {
+    const base = withDate(isoDate);
+    const start = new Date(base.getFullYear(), base.getMonth(), base.getDate(), 8).toISOString();
+    const end   = new Date(base.getFullYear(), base.getMonth(), base.getDate()+2, 23,59,59).toISOString();
+    const bump  = Math.max(0, scen.promoAdj);
+
+    if (brandKey==='patagonia') return [
+      { id:'p1', type:'category', source:'klaviyo', discountPct:Math.round(20+(bump*10)), categoryKeys:['rain','outdoor'], startsAt:start, endsAt:end, intensity:0.7+bump*0.2 }
+    ];
+    if (brandKey==='norsari') return [
+      { id:'p2', type:'email', source:'klaviyo', discountPct:Math.round(10+(bump*10)), categoryKeys:['winter','outdoor'], startsAt:start, endsAt:end, intensity:0.5+bump*0.3 }
+    ];
+    if (brandKey==='kingsford') return [
+      { id:'p3', type:'sitewide', source:'klaviyo', discountPct:Math.round(10+(bump*10)), startsAt:start, endsAt:end, intensity:0.8+bump*0.2 }
+    ];
+    return [];
+  }, []);
+
+  const generateSimCampaignsAt = useCallback((brandKey: string, isoDate: string | null, scen: ScenarioState): CampaignSignal[] => {
+    const base = withDate(isoDate);
+    const start = new Date(base.getFullYear(), base.getMonth(), base.getDate(), 7,30).toISOString();
+    const end   = new Date(base.getFullYear(), base.getMonth(), base.getDate()+1, 22,0).toISOString();
+    const bump  = Math.max(0, scen.campaignAdj);
+
+    if (brandKey==='patagonia') return [
+      { id:'c1', channels:['meta','google'], regions:['WA','OR'], categoryTags:['rain','outdoor','winter'], budgetWeight:Math.min(1,0.6+bump*0.3), startsAt:start, endsAt:end }
+    ];
+    if (brandKey==='norsari') return [
+      { id:'c2', channels:['meta','email'], regions:['MN','WI','ND','SD'], categoryTags:['winter','outdoor'], budgetWeight:Math.min(1,0.5+bump*0.3), startsAt:start, endsAt:end }
+    ];
+    if (brandKey==='kingsford') return [
+      { id:'c3', channels:['meta','google'], regions:['KY','IN','OH','TN'], categoryTags:['summer','outdoor'], budgetWeight:Math.min(1,0.7+bump*0.3), startsAt:start, endsAt:end }
+    ];
+    if (brandKey==='canopy') return [
+      { id:'c4', channels:['meta','google','email'], regions:['NY','NJ','CT','CA'], categoryTags:['winter','indoor','wellness'], budgetWeight:Math.min(1,0.8+bump*0.2), startsAt:start, endsAt:end }
+    ];
+    return [];
+  }, []);
+
+  const generateRealisticWeatherAt = useCallback((brand: Brand, isoDate: string | null, scen: ScenarioState): Weather => {
+    const location = brand.location;
+    const now = withDate(isoDate);
+    const hour = 14;
+    const month = now.getMonth();
+
+    const baseline = cityBaselines[location.city] || cityBaselines['Louisville, KY'];
+    let baseTemp = baseline.tempF[month];
+    let precipProb = baseline.precipProb[month];
+
+    baseTemp = baseTemp * (1 + scen.tempAdj*0.25);
+    if (scen.precipAdj >= 0) precipProb = Math.max(0, Math.min(1, scen.precipAdj));
+
+    const tempCurrent = baseTemp + (rng() - 0.5) * 8 + Math.sin((hour - 14) * Math.PI / 12) * 5;
+    const humidity = 35 + rng() * 50;
+    const windSpeed = 2 + rng() * 18;
+    const precipitation = rng() < precipProb ? +(rng() * 0.8).toFixed(2) : 0;
+    const uvIndex = Math.max(0, Math.min(11, 4 + rng() * 7 - (precipitation * 4)));
+
+    const temperatureC = (tempCurrent - 32) * 5/9;
+    const heatIndex = tempCurrent > 80 ? tempCurrent + (humidity - 40) * 0.1 : tempCurrent;
+    const windChill = tempCurrent < 50 ? tempCurrent - windSpeed * 1.5 : tempCurrent;
+
+    const comfortScore = Math.max(0, Math.min(100,
+      50 + (tempCurrent > 68 && tempCurrent < 78 ? 20 : 0) +
+      (humidity > 30 && humidity < 60 ? 15 : 0) +
+      (windSpeed > 3 && windSpeed < 15 ? 10 : 0) +
+      (precipitation === 0 ? 10 : -20)
+    ));
+
+    const weatherScore = Math.max(0, Math.min(100,
+      (tempCurrent > 65 && tempCurrent < 85 ? 30 : 0) +
+      (precipitation === 0 ? 25 : precipitation > 0.1 ? 20 : 10) +
+      (windSpeed < 20 ? 20 : 5) +
+      (humidity < 80 ? 15 : 5) +
+      (uvIndex > 3 ? 10 : 0)
+    ));
+
+    const conditions = precipitation > 0.1 ? 'Rain' : tempCurrent > 80 ? 'Clear' : 'Partly Cloudy';
+    const description = precipitation > 0.1 ? 'light rain' : tempCurrent > 80 ? 'sunny' : 'partly cloudy';
+
+    return {
+      current: {
+        timestamp: now,
+        temperature: Math.round(tempCurrent * 10) / 10,
+        feelsLike: Math.round(Math.max(heatIndex, windChill) * 10) / 10,
+        humidity: Math.round(humidity),
+        pressure: 1013.25 + (rng() - 0.5) * 40,
+        windSpeed: Math.round(windSpeed * 10) / 10,
+        windDirection: Math.round(rng() * 360),
+        uvIndex: Math.round(uvIndex * 10) / 10,
+        precipitation,
+        conditions,
+        description,
+        location
+      },
+      scientific: {
+        temperatureC,
+        heatIndex,
+        windChill,
+        comfortIndex: comfortScore,
+        weatherScore
+      },
+      meta: {
+        source: 'OpenWeather One Call 3.0 (simulated)',
+        durationMs: 150 + Math.floor(rng() * 250),
+        requestId: `${Math.floor(rng() * 0xFFFF).toString(16)}-${month}`
+      }
+    };
+  }, [rng, cityBaselines]);
+
+  // ==== PATCH G: PREDICTIONS USE REALISTIC SEASONAL LOGIC ====
+  const generateSmartPredictions = useCallback((
+    brand: Brand,
+    weather: Weather,
+    promosNow: PromoSignal[],
+    campaignsNow: CampaignSignal[],
+    autoApply: boolean,
+    isoDate: string | null,
+    brandKey: BrandKey,
+    hist: Record<BrandKey, SpendRecord[]>,
+    scen: ScenarioState
+  ): Prediction[] => {
+
+    const categories = Object.keys(brand.products.categories);
+    const preds: Prediction[] = [];
+    const tempF = weather.current.temperature; // Assume °F for demo
+
+    // Campaign/condition alignment helpers
+    const ctx = {
+      tempF,
+      precip: weather.current.precipitation,
+      weekend: [0,6].includes((weather.current.timestamp as any as Date).getDay()),
+      comfort: weather.scientific.comfortIndex/100,
+    };
+    const channelEffectiveness: Record<string, Record<'meta'|'google'|'tt'|'email', number>> = {
+      winter:   { meta: 0.7, google: 0.9, tt: 0.4, email: 0.8 },
+      rain:     { meta: 0.6, google: 0.8, tt: 0.5, email: 0.7 },
+      summer:   { meta: 0.9, google: 0.9, tt: 0.6, email: 0.6 },
+      outdoor:  { meta: 0.9, google: 0.8, tt: 0.6, email: 0.6 },
+    } as any;
+    const contextBoost = (brandKey: BrandKey, category: string, c: typeof ctx) => {
+      if (brandKey==='kingsford' && category==='summer') {
+        if (c.tempF > 70 && c.precip < 0.1) return 1.25;
+        if (c.precip > 0.2) return 0.7;
+      }
+      if ((brandKey==='norsari' || brandKey==='patagonia') && category==='winter') {
+        if (c.tempF < 45) return 1.3;
+        if (c.tempF > 70) return 0.7;
+      }
+      if (brandKey==='canopy') {
+        if ((category==='winter' || category==='summer') && c.tempF < 40) return 1.4; // Cold = dry air
+        if ((category==='winter' || category==='summer') && c.tempF > 85) return 1.2; // Hot = AC = dry air
+        if (category==='indoor' && c.precip > 0.1) return 1.15; // Rain = poor air quality
+      }
+      if (category==='rain') {
+        if (c.precip > 0.2) return 1.35;
+        return 0.85;
+      }
+      if (category==='outdoor') {
+        if (c.tempF > 55 && c.precip < 0.2) return 1.15;
+        if (c.precip > 0.3) return 0.8;
+      }
+      return 1.0;
+    };
+    const activeCategoryTags = new Set<string>();
+    campaignsNow.forEach(c => (c.categoryTags||[]).forEach(t => activeCategoryTags.add(t)));
+
+    // Filter categories to prevent seasonal conflicts and prioritize based on weather
+    const temp = weather.current.temperature;
+    const relevantCategories = categories.filter(category => {
+      if (!brand.products.categories[category]?.length) return false;
+      if (!allowByBrand(brandKey, category)) return false;
+      
+      // Seasonal filtering logic to prevent winter/summer conflicts
+      if (category === 'winter' && temp > 70) return false; // Too hot for winter
+      if (category === 'summer' && temp < 45) return false; // Too cold for summer
+      
+      return true;
+    });
+
+    // Prioritize categories by weather relevance
+    const sortedCategories = relevantCategories.sort((a, b) => {
+      const multA = getSeasonalMultiplier(brandKey, a, temp, weather.current.precipitation, weather.scientific.comfortIndex / 100);
+      const multB = getSeasonalMultiplier(brandKey, b, temp, weather.current.precipitation, weather.scientific.comfortIndex / 100);
+      return multB - multA; // Sort by highest multiplier first
+    });
+
+    // Limit to top 2-3 most relevant categories to avoid overwhelming display
+    const topCategories = sortedCategories.slice(0, 3);
+
+    topCategories.forEach(category => {
+
+      const features = extractFeatures(weather, promosNow, campaignsNow, category, brandKey, isoDate, hist, scen);
+      const promoActive = features[8], promoStrength = features[9];
+      const campaignStrength = features[11];
+      const todaySpend = features[12];
+      const last7Spend = features[13];
+
+      const k = banditKey(brandKey, category, isoDate);
+      initBandit(k, features.length, 5);
+
+      // Get seasonal multiplier based on realistic business logic
+      const seasonalMult = getSeasonalMultiplier(brandKey, category, tempF, weather.current.precipitation, weather.scientific.comfortIndex / 100);
+      
+      // Even if seasonal opportunity is low, we will still surface a
+      // neutral recommendation so Explorer is populated, but keep
+      // multiplier at 1.0 and low expected lift.
+
+      const { ucbThreshold, dampenLift } = promoGuard(promoActive, promoStrength, campaignStrength);
+      const { expectedReward, uncertainty, ucb, confidence } = computeUCB(k, features);
+      
+      // Slightly ease UCB threshold on strong seasonal days; adjust by campaign alignment
+      const tagsAligned = activeCategoryTags.has(category);
+      const chanEff = channelEffectiveness[category as keyof typeof channelEffectiveness] || { meta: 0.8, google: 0.8, tt: 0.5, email: 0.6 };
+      const avgChan = campaignsNow.length ? campaignsNow.reduce((s,c)=> s + c.channels.reduce((a,ch)=> a + (chanEff[ch]||0.6),0)/Math.max(c.channels.length,1), 0)/campaignsNow.length : 0.7;
+      const ctxB = contextBoost(brandKey, category, ctx);
+      const alignScore = (tagsAligned ? 1.0 : 0.88) * (0.55 + 0.45*avgChan) * ctxB; // ~0.5..1.5
+      const gateBoost = (seasonalMult >= 2 ? 0.85 : 1) * (alignScore > 1.0 ? 0.9 : (campaignStrength > 0.5 ? 1.1 : 1.0));
+      const adjustedThreshold = ucbThreshold * gateBoost;
+      const passes = ucb > adjustedThreshold;
+
+      // Calculate realistic lift and budget multiplier
+      const seasonDamped = Math.min(3.0, 1 + (seasonalMult - 1) * 0.6);
+      const spendBoost = todaySpend > 0.1 ? 1.2 : (last7Spend > 0.2 ? 1.1 : 1.0);
+      const campaignBoost = Math.max(0.8, Math.min(1.3, alignScore));
+      const computedMult = Math.round((seasonDamped * dampenLift * spendBoost * campaignBoost) * 100) / 100;
+      const finalMultiplier = passes ? computedMult : 1.0;
+      
+      // Expected lift correlates with multiplier
+      const expectedLiftPct = Math.max(0, Math.round(Math.min(60, (finalMultiplier - 1) * 38 + (passes ? 10 : 0))));
+
+      const names = ['temp','precip','wind','hum','uv','comfort','score','weekend','promo','promoStr','camp','campStr','spendToday','spend7d'];
+      const top = features.map((v,i)=>({feature:names[i], v}))
+        .sort((a,b)=> Math.abs(b.v)-Math.abs(a.v))
+        .slice(0,3);
+
+      // Create business-sensible reasoning
+      let seasonReason = '';
+      if (brandKey === 'norsari' && category === 'winter') {
+        seasonReason = tempF < 40 ? `Cold weather (${Math.round(tempF)}°F) drives winter wrap demand` :
+                      tempF > 75 ? `Hot weather reduces winter product appeal` :
+                      'Moderate temperatures for winter gear';
+      } else if (brandKey === 'kingsford' && category === 'summer') {
+        seasonReason = (tempF > 70 && weather.current.precipitation < 0.1) ? 
+                      `Perfect grilling weather (${Math.round(tempF)}°F, dry)` :
+                      weather.current.precipitation > 0.2 ? 'Rain suppresses grilling activity' :
+                      'Suboptimal grilling conditions';
+      } else {
+        seasonReason = `${Math.round(tempF)}°F conditions for ${category} products`;
+      }
+
+      const reasoning = [
+        `${seasonReason} • Context ${ctxB.toFixed(2)}x • Campaign align ${alignScore.toFixed(2)}x`,
+        `UCB ${ucb.toFixed(2)} vs ${adjustedThreshold.toFixed(2)} • Channels ${campaignsNow.map(c=>c.channels.join('+')).join(' / ') || 'none'}`,
+        `Top signals: ${top.map(t=>`${t.feature}=${t.v.toFixed(2)}`).join(', ')}`,
+        promoActive ? `Promo discount factored (${promoStrength.toFixed(1)})` : 'No promo adjustment',
+        (todaySpend>0.05 || last7Spend>0.1) ? `Recent ad spend supporting performance` : 'Minimal ad spend'
+      ].join(' • ');
+
+      if (autoApply) {
+        setAutomationLog(prev => [
+          { time: new Date().toISOString(), msg: `Auto-applied: ${brand.name} → ${category} ${finalMultiplier}x budget (${seasonReason.toLowerCase()})` },
+          ...prev.slice(0,20)
+        ]);
+      }
+
+      preds.push({
+        category,
+        products: brand.products.categories[category],
+        action: finalMultiplier > 1.1 ? 'increase' : 'maintain',
+        budgetMultiplier: finalMultiplier,
+        expectedLift: `${expectedLiftPct}%`,
+        confidence: passes ? confidence : Math.min(0.65, confidence),
+        reasoning,
+        timestamp: new Date(),
+        aiModel: 'Seasonal LinUCB',
+        features,
+        ucbScore: ucb
+      });
+
+      const reward = (expectedLiftPct/50) * (1 - Math.min(0.5, 0.4*promoStrength + 0.2*campaignStrength));
+      updateBandit(k, features, reward);
+    });
+
+    return preds.sort((a,b)=> b.budgetMultiplier - a.budgetMultiplier);
+  }, []);
+
+  // ==================== EFFECTS & HANDLERS ====================
+
+  const addNotification = useCallback((message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    const id = Date.now();
+    const notification = { id, message, type, timestamp: new Date(), dismissed: false };
+    
+    setNotifications(prev => [...prev, notification]);
+    
+    const timeout = setTimeout(() => {
+      setNotifications(prev => prev.map(n => 
+        n.id === id ? { ...n, dismissed: true } : n
+      ));
+      notificationTimeouts.current.delete(id);
+    }, 5000);
+    
+    notificationTimeouts.current.set(id, timeout);
+  }, []);
+
+  // ==== PATCH H: DATE-AWARE PIPELINE (with scenario and spend) ====
+  const runDemoPipeline = useCallback(async () => {
+    if (platformMode !== 'demo') return;
+
+    const brandKey = (selectedBrand as BrandKey);
+    setLiveData(prev => ({ ...prev, isLoading: true }));
+    setInitializationStep('Gathering signals (weather • promo • campaigns • spend)...');
+    await new Promise(r => setTimeout(r, 400));
+
+    const wx = generateRealisticWeatherAt(demoBrands[selectedBrand], selectedSimDate, scenario);
+    const pr = generateSimPromosAt(selectedBrand, selectedSimDate, scenario);
+    const ca = generateSimCampaignsAt(selectedBrand, selectedSimDate, scenario);
+    setPromos(pr); setCampaigns(ca);
+
+    await new Promise(r => setTimeout(r, 300));
+    setInitializationStep('Computing integrated recommendations...');
+    const preds = generateSmartPredictions(
+      demoBrands[selectedBrand], wx, pr, ca, automationEnabled,
+      selectedSimDate, brandKey, adSpendHistory, scenario
+    );
+
+    setLiveData({
+      weather: wx,
+      predictions: preds,
+      lastUpdated: new Date(),
+      isLoading: false,
+      errors: []
+    });
+    setInitializationStep('');
+    setIsInitializing(false);
+    addNotification(automationEnabled ? 'Automation active: decisions applied' : 'Manual mode: review recommendations', 'success');
+  }, [platformMode, selectedBrand, selectedSimDate, demoBrands, scenario, automationEnabled, adSpendHistory,
+      generateRealisticWeatherAt, generateSimPromosAt, generateSimCampaignsAt, generateSmartPredictions, addNotification]);
+
+  // ==== Refresh loop calls pipeline; clear on mode/brand change ====
+  useEffect(() => {
+    if (platformMode === 'demo' && !liveData.isLoading) {
+      intervalRef.current = setInterval(() => {
+        setDemoMetrics(prev => ({
+          ...prev,
+          predictionsPerSecond: 2800 + Math.floor(rng() * 100),
+          dataPointsProcessed: prev.dataPointsProcessed + Math.floor(rng() * 1000)
+        }));
+        runDemoPipeline();
+      }, 30000);
+      return () => { if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; } };
+    }
+  }, [platformMode, runDemoPipeline, rng, liveData.isLoading]);
+
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+    };
+  }, [platformMode, selectedBrand]);
+
+  // ==== Debounced recompute on date/scenario changes; avoid weather-driven loops ====
+  const scenRef = useRef(scenario);
+  useEffect(() => { scenRef.current = scenario; }, [scenario]);
+  useEffect(() => {
+    if (platformMode !== 'demo' || !selectedSimDate) return;
+    const id = setTimeout(() => runDemoPipeline(), 200);
+    return () => clearTimeout(id);
+  }, [selectedSimDate, scenario, platformMode, runDemoPipeline]);
+
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      notificationTimeouts.current.forEach(timeout => clearTimeout(timeout));
+      notificationTimeouts.current.clear();
+    };
+  }, []);
+
+  // ==================== NEW VIEWS ====================
+
+  // ==== PATCH K: SCENARIO SIMULATOR VIEW ====
+  /* moved to lazy-loaded view */
+  const SimulatorView = React.memo(() => {
+    const Row = ({label, children}:{label:string; children:any}) => (
+      <div className="flex items-center justify-between py-3 border-b">
+        <div className="text-sm text-gray-700">{label}</div>
+        <div className="w-2/3">{children}</div>
+      </div>
+    );
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <div className="max-w-3xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-lg p-6 border border-gray-200">
+            <div className="flex items-center justify-between mb-4">
+              <button onClick={()=> go('dashboard')} className="px-3 py-1 rounded-full bg-white border text-gray-700 hover:bg-gray-50">← Back</button>
+              <h2 className="text-xl font-semibold">Scenario Simulator</h2>
+              <div/>
+            </div>
+
+            <p className="text-sm text-gray-600 mb-6">Test "what-if" conditions. Changes affect the demo date snapshot.</p>
+
+            <Row label="Temperature adjustment">
+              <input type="range" min={-1} max={1} step={0.1} className="w-full"
+                value={scenario.tempAdj}
+                onChange={(e)=> setScenario(s=>({...s, tempAdj: parseFloat(e.target.value)}))}
+              />
+            </Row>
+            <Row label="Precipitation override (0 = dry, 1 = heavy)">
+              <input type="range" min={-1} max={1} step={0.05} className="w-full"
+                value={scenario.precipAdj}
+                onChange={(e)=> setScenario(s=>({...s, precipAdj: parseFloat(e.target.value)}))}
+              />
+            </Row>
+            <Row label="Promo intensity (+)">
+              <input type="range" min={0} max={1} step={0.05} className="w-full"
+                value={scenario.promoAdj}
+                onChange={(e)=> setScenario(s=>({...s, promoAdj: parseFloat(e.target.value)}))}
+              />
+            </Row>
+            <Row label="Campaign push (+)">
+              <input type="range" min={0} max={1} step={0.05} className="w-full"
+                value={scenario.campaignAdj}
+                onChange={(e)=> setScenario(s=>({...s, campaignAdj: parseFloat(e.target.value)}))}
+              />
+            </Row>
+            <Row label="Ad spend support (− to +)">
+              <input type="range" min={-1} max={1} step={0.1} className="w-full"
+                value={scenario.adSpendAdj}
+                onChange={(e)=> setScenario(s=>({...s, adSpendAdj: parseFloat(e.target.value)}))}
+              />
+            </Row>
+
+            <div className="mt-6 flex items-center justify-between">
+              <div className="text-sm text-gray-600">
+                <div>Plain English:</div>
+                <ul className="list-disc ml-5">
+                  <li>{scenario.tempAdj>0 ? 'Warmer than usual' : scenario.tempAdj<0 ? 'Colder than usual' : 'Normal temps'}.</li>
+                  <li>{scenario.precipAdj<0 ? 'Using typical rain pattern' : (scenario.precipAdj===0 ? 'Dry' : scenario.precipAdj>0.6 ? 'Stormy' : 'Light rain')}.</li>
+                  <li>{scenario.promoAdj>0 ? 'Promotions are stronger than usual.' : 'No extra promo boost.'}</li>
+                  <li>{scenario.campaignAdj>0 ? 'Paid channels are being pushed.' : 'No extra campaign push.'}</li>
+                  <li>{scenario.adSpendAdj>0 ? 'Extra ad spend support.' : scenario.adSpendAdj<0 ? 'Reduced spend support.' : 'Baseline spend.'}</li>
+                </ul>
+              </div>
+              <button
+                onClick={() => runDemoPipeline()}
+                className="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+              >
+                Apply & Recompute
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // ==== PATCH L: CAMPAIGNS VIEW ====
+  /* moved to lazy-loaded view */
+  const CampaignsView = React.memo(() => {
+    const brand = demoBrands[selectedBrand];
+    const data = campaigns;
+    const categories = Object.keys(brand.products.categories);
+
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <div className="max-w-5xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-lg p-6 border">
+            <div className="flex items-center justify-between mb-4">
+              <button onClick={()=> go('dashboard')} className="px-3 py-1 rounded-full bg-white border text-gray-700 hover:bg-gray-50">← Back</button>
+              <h2 className="text-xl font-semibold">Campaigns (Meta · Google)</h2>
+              <div/>
+            </div>
+
+            {data.length===0 ? (
+              <div className="text-gray-600">No active campaigns detected for the selected date.</div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {data.map(c => (
+                  <div key={c.id} className="border rounded-lg p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="font-medium">Campaign {c.id.toUpperCase()}</div>
+                      <span className="text-xs px-2 py-1 rounded bg-indigo-100 text-indigo-800">{c.channels.join(' + ')}</span>
+                    </div>
+                    <div className="text-sm text-gray-600 mt-1">Regions: {(c.regions ?? ['US']).join(', ')}</div>
+                    <div className="text-sm text-gray-600">Budget push: {(c.budgetWeight ?? 0.5).toFixed(2)}</div>
+
+                    <div className="mt-3">
+                      <label className="text-xs text-gray-500">Tags (affects categories)</label>
+                      <div className="flex flex-wrap gap-2 mt-2">
+                        {categories.map(cat => (
+                          <button key={cat} className="px-2 py-1 rounded-full bg-gray-100 text-xs hover:bg-gray-200">{cat}</button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-between">
+                      <div className="text-xs text-gray-600">Automation for this campaign</div>
+                      <label className="inline-flex items-center cursor-pointer">
+                        <input type="checkbox" defaultChecked className="sr-only peer"/>
+                        <div className="w-10 h-5 bg-gray-200 rounded-full peer-checked:bg-emerald-500 relative after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:bg-white after:rounded-full peer-checked:after:translate-x-5 transition"></div>
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // ==== PATCH M: PRODUCT/CATEGORY EXPLORER ====
+  /* moved to lazy-loaded view */
+  const ExplorerView = React.memo(() => {
+    const brand = demoBrands[selectedBrand];
+    const cats = Object.keys(brand.products.categories);
+
+    const sample = liveData.predictions ?? [];
+    const contribByCat: Record<string, Array<{name:string; contribution:number}>> = {};
+    cats.forEach(cat => {
+      const p = sample.find(s => s.category===cat);
+      if (p) {
+        const names = ['Temperature','Precipitation','Wind','Humidity','UV','Comfort','WeatherScore','Weekend','PromoActive','PromoStrength','CampaignActive','CampaignStrength','SpendToday','Spend7d'];
+        contribByCat[cat] = p.features.map((v,i)=>({name:names[i], contribution: +v.toFixed(2)}))
+          .sort((a,b)=> Math.abs(b.contribution)-Math.abs(a.contribution))
+          .slice(0,5);
+      }
+    });
+
+    const ExplorerCharts = useMemo(() => lazy(() => import('./charts/ExplorerCharts')) as any, []);
+
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <div className="max-w-6xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-lg p-6 border">
+            <div className="flex items-center justify-between mb-4">
+              <button onClick={()=> go('dashboard')} className="px-3 py-1 rounded-full bg-white border text-gray-700 hover:bg-gray-50">← Back</button>
+              <h2 className="text-xl font-semibold">Explorer — What drives each category?</h2>
+              <div/>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {cats.map(cat => (
+                <div key={cat} className="border rounded-lg p-4">
+                  <div className="font-medium mb-2 capitalize">{cat}</div>
+                  {contribByCat[cat]?.length ? (
+                    <>
+                      <div className="space-y-2">
+                        {contribByCat[cat].map(row => (
+                          <div key={row.name} className="flex items-center justify-between">
+                            <span className="text-sm text-gray-700">{row.name}</span>
+                            <div className="flex items-center space-x-2 w-1/2">
+                              <div className="w-full bg-gray-200 rounded-full h-2">
+                                <div className="bg-indigo-500 h-2 rounded-full" style={{width: `${Math.min(100, Math.abs(row.contribution)*100)}%`}}></div>
+                              </div>
+                              <span className="text-xs text-gray-600 w-12 text-right">{row.contribution.toFixed(2)}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-4">
+                        <Suspense fallback={<div className="text-xs text-gray-400">Loading chart…</div>}>
+                          <ExplorerCharts data={contribByCat[cat]} />
+                        </Suspense>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-gray-500 text-sm">No contribution data yet.</div>
+                  )}
+                  <div className="text-xs text-gray-600 mt-3">
+                    Plain English: Top factors currently shifting <span className="font-medium">{cat}</span> performance are highlighted.  
+                    "Spend" shows how much recent budget is supporting outcomes even on poor-weather days.
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // ==== PATCH N: PLAYBOOKS VIEW ====
+  /* moved to lazy-loaded view */
+  const PlaybooksView = React.memo(() => {
+    const playbooks = [
+      { id:'pb-rain', name:'Rain Surge', desc:'Increase rain gear when precipitation is high & comfort is decent.', on: true },
+      { id:'pb-cold', name:'Cold Snap Conversion', desc:'Boost winter wraps below 45°F when conversion baseline >2%.', on: true },
+      { id:'pb-bbq',  name:'BBQ Weekend Lift', desc:'Push charcoal Fri–Sun when 65–90°F and dry.', on: true },
+    ];
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <div className="max-w-4xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-lg p-6 border">
+            <div className="flex items-center justify-between mb-4">
+              <button onClick={()=> go('dashboard')} className="px-3 py-1 rounded-full bg-white border text-gray-700 hover:bg-gray-50">← Back</button>
+              <h2 className="text-xl font-semibold">Automation Playbooks</h2>
+              <div/>
+            </div>
+            <div className="space-y-4">
+              {playbooks.map(pb => (
+                <div key={pb.id} className="border rounded-lg p-4 flex items-center justify-between">
+                  <div>
+                    <div className="font-medium">{pb.name}</div>
+                    <div className="text-sm text-gray-600">{pb.desc}</div>
+                  </div>
+                  <label className="inline-flex items-center cursor-pointer">
+                    <input type="checkbox" defaultChecked={pb.on} className="sr-only peer"/>
+                    <div className="w-10 h-5 bg-gray-200 rounded-full peer-checked:bg-emerald-500 relative after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:bg-white after:rounded-full peer-checked:after:translate-x-5 transition"></div>
+                  </label>
+                </div>
+              ))}
+            </div>
+            <div className="text-xs text-gray-600 mt-4">Playbooks are friendly presets on top of the bandit — you can keep them on while the model still learns.</div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // ==== PATCH O: PERFORMANCE VIEW ====
+  /* moved to lazy-loaded view */
+  const PerformanceView = React.memo(() => {
+    const actions30d = 120 + Math.floor(rng()*40);
+    const roasLift = 0.15 + rng()*0.06;
+    const accuracy = 0.9 + rng()*0.05;
+
+    return (
+      <div className="min-h-screen bg-gray-50">
+        <div className="max-w-5xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-lg p-6 border">
+            <div className="flex items-center justify-between mb-4">
+              <button onClick={()=> go('dashboard')} className="px-3 py-1 rounded-full bg-white border text-gray-700 hover:bg-gray-50">← Back</button>
+              <h2 className="text-xl font-semibold">Performance (Last 30 Days — Demo)</h2>
+              <div/>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+              <div className="border rounded-lg p-4">
+                <div className="text-xs text-gray-500">Automation Actions</div>
+                <div className="text-2xl font-bold">{actions30d}</div>
+                <div className="text-xs text-gray-600">Budget changes auto-applied</div>
+              </div>
+              <div className="border rounded-lg p-4">
+                <div className="text-xs text-gray-500">Avg ROAS Lift</div>
+                <div className="text-2xl font-bold">{Math.round(roasLift*100)}%</div>
+                <div className="text-xs text-gray-600">Promotion-aware estimates</div>
+              </div>
+              <div className="border rounded-lg p-4">
+                <div className="text-xs text-gray-500">Decision Accuracy</div>
+                <div className="text-2xl font-bold">{Math.round(accuracy*100)}%</div>
+                <div className="text-xs text-gray-600">Out-of-window validation</div>
+              </div>
+            </div>
+
+            <div className="text-sm text-gray-700">
+              This demo illustrates the volume and quality of automated decisions when promotions, campaigns, weather, and ad spend are integrated.  
+              In production, these KPIs are computed from Shopify/Meta/Google/Klaviyo logs and validated against holdouts.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // Premium Landing (Framer/Webflow-style)
+  const PremiumLandingPage = React.memo(() => {
+    const [mx, setMx] = useState(0)
+    const [my, setMy] = useState(0)
+    const onMove = (e: React.MouseEvent<HTMLDivElement>) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      const x = (e.clientX - (r.left + r.width/2)) / r.width;
+      const y = (e.clientY - (r.top + r.height/2)) / r.height;
+      setMx(x); setMy(y);
+    }
+    const par = (f: number) => ({ transform: `translate3d(${mx*24*f}px, ${my*24*f}px, 0)` })
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-indigo-950 to-indigo-900 relative overflow-hidden" onMouseMove={onMove}>
+        <div className="absolute inset-0 overflow-hidden">
+          <motion.div style={par(1)} className="absolute -top-40 -right-40 w-96 h-96 bg-blue-500/20 rounded-full filter blur-3xl animate-pulse-slow" />
+          <motion.div style={par(-1)} className="absolute -bottom-40 -left-40 w-96 h-96 bg-indigo-500/20 rounded-full filter blur-3xl animate-pulse-slow" />
+          <motion.div style={par(0.5)} className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-[28rem] h-[28rem] bg-purple-500/20 rounded-full filter blur-3xl animate-pulse-slow" />
+          <div className="absolute inset-0 pointer-events-none bg-radial-fade" />
+        </div>
+
+        <div className="relative z-10 max-w-7xl mx-auto px-6 py-20">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 items-center">
+            <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }}>
+              <div className="inline-flex items-center px-3 py-1 rounded-full bg-white/10 text-blue-200 border border-white/20 text-xs mb-4">
+                Weather • Promotions • Spend • Campaigns → One brain
+              </div>
+              <h1 className="text-4xl sm:text-5xl font-extrabold text-white leading-tight">
+                Grow revenue by letting weather drive your marketing
+              </h1>
+              <p className="text-lg text-indigo-100/90 mt-4 max-w-xl">
+                We sense live weather and promotions, predict category shifts by city and day, and safely
+                allocate budget across Meta/Google so you stop overspending on the wrong days.
+              </p>
+              <div className="flex flex-wrap gap-3 mt-8">
+                <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}
+                  onClick={() => { setPlatformMode('demo'); go('brandSelection'); }}
+                  className="px-5 py-3 rounded-xl bg-white text-slate-900 font-semibold shadow-glow">
+                  Launch Interactive Demo
+                </motion.button>
+                <button onClick={() => go('explorer')} className="px-5 py-3 rounded-xl border border-white/30 text-white/90 hover:bg-white/10">
+                  Explore the Signals
+                </button>
+              </div>
+              <div className="mt-6 text-xs text-white/60">
+                Simulated data. Production integrates OpenWeather, Shopify, Meta, Klaviyo.
+              </div>
+            </motion.div>
+            <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6, delay: 0.05 }}
+              className="glass rounded-2xl border-white/20 p-6">
+              <div className="grid grid-cols-3 gap-4 text-center">
+                <div>
+                  <div className="text-3xl font-bold text-white">12–25%</div>
+                  <div className="text-xs text-indigo-100/80">Avg ROAS lift (demo)</div>
+                </div>
+                <div>
+                  <div className="text-3xl font-bold text-white">18–35%</div>
+                  <div className="text-xs text-indigo-100/80">Waste reduced</div>
+                </div>
+                <div>
+                  <div className="text-3xl font-bold text-white">Hours</div>
+                  <div className="text-xs text-indigo-100/80">Saved weekly</div>
+                </div>
+              </div>
+              <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="rounded-xl bg-indigo-950/40 border border-white/10 p-4">
+                  <div className="text-white font-semibold mb-1">Sense</div>
+                  <div className="text-indigo-100/90 text-sm">Weather + promos + spend + campaigns</div>
+                </div>
+                <div className="rounded-xl bg-indigo-950/40 border border-white/10 p-4">
+                  <div className="text-white font-semibold mb-1">Decide</div>
+                  <div className="text-indigo-100/90 text-sm">Seasonal LinUCB with guardrails</div>
+                </div>
+                <div className="rounded-xl bg-indigo-950/40 border border-white/10 p-4">
+                  <div className="text-white font-semibold mb-1">Act</div>
+                  <div className="text-indigo-100/90 text-sm">Auto‑allocate budget by category</div>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+
+          <div className="mt-16 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="bg-white/5 border border-white/10 rounded-xl p-5">
+              <div className="text-white font-semibold mb-1">DTC & Omnichannel Brands</div>
+              <div className="text-indigo-100/90 text-sm">Weather‑sensitive categories: winterwear, rain gear, grilling, outdoor.</div>
+            </div>
+            <div className="bg-white/5 border border-white/10 rounded-xl p-5">
+              <div className="text-white font-semibold mb-1">Growth & Performance Leads</div>
+              <div className="text-indigo-100/90 text-sm">Turn climate noise into action without spreadsheets.</div>
+            </div>
+            <div className="bg-white/5 border border-white/10 rounded-xl p-5">
+              <div className="text-white font-semibold mb-1">Small Teams</div>
+              <div className="text-indigo-100/90 text-sm">Automation that explains itself. You stay in control.</div>
+            </div>
+          </div>
+
+          <div className="mt-16 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="rounded-xl border border-white/10 bg-white/5 p-6">
+              <div className="flex items-center gap-3 mb-2 text-white"><Sun className="w-4 h-4"/> Weather‑aware demand</div>
+              <div className="text-indigo-100/90 text-sm">Predict category shifts by city and day, not just ad set averages.</div>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-white/5 p-6">
+              <div className="flex items-center gap-3 mb-2 text-white"><Brain className="w-4 h-4"/> Safe budget moves</div>
+              <div className="text-indigo-100/90 text-sm">Upper‑confidence bounds and promo guardrails prevent overspend.</div>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-white/5 p-6">
+              <div className="flex items-center gap-3 mb-2 text-white"><TrendingUp className="w-4 h-4"/> Real outcomes</div>
+              <div className="text-indigo-100/90 text-sm">Less waste on bad‑weather days, more capture when demand spikes.</div>
+            </div>
+          </div>
+
+          <div className="mt-16 flex flex-wrap items-center gap-4">
+            <button onClick={() => { setPlatformMode('demo'); go('brandSelection'); }} className="px-5 py-3 rounded-xl bg-white text-slate-900 font-semibold">Try the Demo</button>
+            <button onClick={() => go('simulator')} className="px-5 py-3 rounded-xl border border-white/30 text-white/90 hover:bg-white/10">Open Scenario Simulator</button>
+            <div className="text-xs text-white/60">No signup • 100% simulated • API‑compatible</div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // ==================== RENDER COMPONENTS ====================
+
+  const LandingPage = React.memo(() => {
+    const [mx, setMx] = useState(0)
+    const [my, setMy] = useState(0)
+    const onMove = (e: React.MouseEvent<HTMLDivElement>) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      const x = (e.clientX - (r.left + r.width/2)) / r.width;
+      const y = (e.clientY - (r.top + r.height/2)) / r.height;
+      setMx(x); setMy(y);
+    }
+    const par = (f: number) => ({ transform: `translate3d(${mx*20*f}px, ${my*20*f}px, 0)` })
+    return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-indigo-900 relative overflow-hidden" onMouseMove={onMove}>
+      <div className="absolute inset-0 overflow-hidden">
+        <motion.div style={par(1)} className="absolute -top-40 -right-40 w-80 h-80 bg-blue-500/20 rounded-full filter blur-2xl animate-pulse-slow" />
+        <motion.div style={par(-1)} className="absolute -bottom-40 -left-40 w-80 h-80 bg-indigo-500/20 rounded-full filter blur-2xl animate-pulse-slow" />
+        <motion.div style={par(0.5)} className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-60 h-60 bg-purple-500/20 rounded-full filter blur-2xl animate-pulse-slow" />
+        <div className="absolute inset-0 pointer-events-none bg-radial-fade"></div>
+      </div>
+
+      <div className="relative z-10 flex items-center justify-center min-h-screen p-6">
+        <div className="max-w-6xl mx-auto">
+          <motion.div className="text-center mb-16" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6 }}>
+            <motion.div whileHover={{ scale: 1.03 }} transition={{ type: 'spring', stiffness: 180, damping: 12 }} className="inline-flex items-center justify-center w-24 h-24 bg-gradient-to-r from-blue-400 to-indigo-400 rounded-full mb-8 shadow-2xl shadow-indigo-500/30 ring-1 ring-white/30">
+              <Brain className="w-12 h-12 text-white" />
+            </motion.div>
+            
+            <h1 className="text-6xl font-bold text-white mb-6 leading-tight">
+              Weather Intelligence
+              <span className="block text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400">
+                Automation Platform
+              </span>
+            </h1>
+            
+            <p className="text-xl text-gray-300 mb-12 max-w-3xl mx-auto leading-relaxed">
+              Complete automation suite with scenario simulator, campaign management, and ad spend optimization. 
+              Experience the future of weather-driven marketing intelligence.
+            </p>
+          </motion.div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-12">
+            <motion.button whileHover={{ scale: 1.02, y: -2 }} whileTap={{ scale: 0.98 }}
+              onClick={() => {
+                setPlatformMode('demo');
+                go('brandSelection');
+              }}
+              className="group relative bg-gradient-to-br from-blue-900/50 to-indigo-900/50 backdrop-blur-xl rounded-2xl p-8 border border-blue-400/20 hover:border-blue-400/40 transition-all duration-500 hover:scale-[1.02] hover:-translate-y-0.5 text-left focus:outline-none focus:ring-2 focus:ring-blue-400"
+              aria-label="Start Full Platform Demo"
+            >
+              <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-indigo-500/10 rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity"></div>
+              
+              <div className="relative z-10">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="w-16 h-16 bg-gradient-to-r from-blue-500 to-indigo-500 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
+                    <Play className="w-8 h-8 text-white" />
+                  </div>
+                  <div className="text-right">
+                    <div className="text-2xl font-bold text-white">Full Platform Demo</div>
+                    <div className="text-blue-300 text-sm">All Features Enabled</div>
+                  </div>
+                </div>
+                
+                <h3 className="text-2xl font-bold text-white mb-4">Complete Experience</h3>
+                <p className="text-blue-100 mb-6 leading-relaxed">
+                  Interactive scenario simulator, campaign management, feature explorer, automation playbooks, 
+                  and performance analytics with real brands and ad spend optimization.
+                </p>
+                
+                <div className="space-y-3">
+                  <div className="flex items-center text-blue-200">
+                    <Settings className="w-4 h-4 mr-3" />
+                    <span className="text-sm">Scenario simulator with sliders</span>
+                  </div>
+                  <div className="flex items-center text-blue-200">
+                    <Network className="w-4 h-4 mr-3" />
+                    <span className="text-sm">Campaign & ad spend management</span>
+                  </div>
+                  <div className="flex items-center text-blue-200">
+                    <TrendingUp className="w-4 h-4 mr-3" />
+                    <span className="text-sm">Performance & ROI analytics</span>
+                  </div>
+                </div>
+                
+                <div className="mt-6 text-blue-300 text-sm font-medium">Launch Full Demo →</div>
+              </div>
+            </motion.button>
+
+            <motion.button whileHover={{ scale: 1.02, y: -2, boxShadow: '0 8px 40px rgba(34,197,94,0.25)' }} whileTap={{ scale: 0.98 }}
+              onClick={() => {
+                setPlatformMode('production');
+                navigate('/setup');
+              }}
+              className="group relative bg-gradient-to-br from-emerald-900/50 to-teal-900/50 backdrop-blur-xl rounded-2xl p-8 border border-emerald-400/20 hover:border-emerald-400/40 transition-all duration-500 hover:scale-[1.02] hover:-translate-y-0.5 text-left focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              aria-label="Connect Your Business"
+            >
+              <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/10 to-teal-500/10 rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity"></div>
+              
+              <div className="relative z-10">
+                <div className="flex items-center justify-between mb-6">
+                  <div className="w-16 h-16 bg-gradient-to-r from-emerald-500 to-teal-500 rounded-xl flex items-center justify-center shadow-lg">
+                    <Shield className="w-8 h-8 text-white" />
+                  </div>
+                  <div className="text-right">
+                    <div className="text-2xl font-bold text-white">Production Ready</div>
+                    <div className="text-emerald-300 text-sm">Your Business</div>
+                  </div>
+                </div>
+                
+                <h3 className="text-2xl font-bold text-white mb-4">Live Integration</h3>
+                <p className="text-emerald-100 mb-6 leading-relaxed">
+                  Connect OpenWeather One Call 3.0, Shopify 2025-07, Meta v23.0, and Klaviyo APIs. 
+                  Deploy full automation with real campaign management and spend optimization.
+                </p>
+                
+                <div className="space-y-3">
+                  <div className="flex items-center text-emerald-200">
+                    <CheckCircle2 className="w-4 h-4 mr-3" />
+                    <span className="text-sm">Live API integrations</span>
+                  </div>
+                  <div className="flex items-center text-emerald-200">
+                    <Database className="w-4 h-4 mr-3" />
+                    <span className="text-sm">Real campaign automation</span>
+                  </div>
+                  <div className="flex items-center text-emerald-200">
+                    <Activity className="w-4 h-4 mr-3" />
+                    <span className="text-sm">Performance tracking</span>
+                  </div>
+                </div>
+                
+                <div className="mt-6 text-emerald-300 text-sm font-medium">Connect APIs →</div>
+              </div>
+            </motion.button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <div className="w-12 h-12 bg-purple-400/20 rounded-lg flex items-center justify-center mb-4 mx-auto">
+                <Brain className="w-6 h-6 text-purple-400" />
+              </div>
+              <h3 className="text-lg font-semibold text-white mb-2 text-center">Smart AI</h3>
+              <p className="text-gray-300 text-sm text-center">LinUCB with ad spend optimization</p>
+            </div>
+            
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <div className="w-12 h-12 bg-blue-400/20 rounded-lg flex items-center justify-center mb-4 mx-auto">
+                <Settings className="w-6 h-6 text-blue-400" />
+              </div>
+              <h3 className="text-lg font-semibold text-white mb-2 text-center">Simulator</h3>
+              <p className="text-gray-300 text-sm text-center">Interactive scenario testing</p>
+            </div>
+            
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <div className="w-12 h-12 bg-green-400/20 rounded-lg flex items-center justify-center mb-4 mx-auto">
+                <Network className="w-6 h-6 text-green-400" />
+              </div>
+              <h3 className="text-lg font-semibold text-white mb-2 text-center">Campaigns</h3>
+              <p className="text-gray-300 text-sm text-center">Meta/Google management</p>
+            </div>
+
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <div className="w-12 h-12 bg-orange-400/20 rounded-lg flex items-center justify-center mb-4 mx-auto">
+                <TrendingUp className="w-6 h-6 text-orange-400" />
+              </div>
+              <h3 className="text-lg font-semibold text-white mb-2 text-center">Analytics</h3>
+              <p className="text-gray-300 text-sm text-center">ROI & performance metrics</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )});
+
+  const BrandSelection = React.memo(() => (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-indigo-900">
+      <div className="relative z-10 flex items-center justify-center min-h-screen p-6">
+        <div className="max-w-5xl mx-auto">
+          <div className="text-center mb-12">
+            <button
+              onClick={() => go('landing')}
+              className="px-4 py-2 mb-8 rounded-full bg-white/20 border border-white/30 text-white hover:bg-white/30 transition-colors focus:outline-none focus:ring-2 focus:ring-white/50"
+            >
+              ← Back to options
+            </button>
+            
+            <h1 className="text-4xl font-bold text-white mb-4">
+              Choose Your Brand Experience
+            </h1>
+            <p className="text-xl text-gray-300 max-w-2xl mx-auto">
+              Experience the complete automation platform through real seasonal brands with 12-day scenario calendar
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-8">
+            {Object.entries(demoBrands).map(([key, brand]) => (
+              <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}
+                key={key}
+                onClick={() => {
+                  setSelectedBrand(key);
+                  go('dashboard');
+                  setIsInitializing(true);
+                  runDemoPipeline();
+                }}
+                className={`group relative bg-gradient-to-br ${brand.colors.primary}/20 backdrop-blur-xl rounded-2xl p-8 border border-white/20 hover:border-white/40 transition-all duration-500 hover:scale-105 text-center focus:outline-none focus:ring-2 focus:ring-white/50`}
+                aria-label={`Select ${brand.name}`}
+              >
+                <div className="text-6xl mb-4">{brand.logo}</div>
+                <h3 className="text-2xl font-bold text-white mb-2">{brand.name}</h3>
+                <p className="text-gray-300 mb-6">{brand.description}</p>
+                
+                <div className="space-y-3 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-400">Location:</span>
+                    <span className="text-white">{brand.location.city}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-400">Products:</span>
+                    <span className="text-white">{brand.products.total}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-400">Monthly Revenue:</span>
+                    <span className="text-white">${(brand.monthlyRevenue / 1000000).toFixed(1)}M</span>
+                  </div>
+                </div>
+                
+                <div className="mt-6 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className="px-4 py-2 bg-white/20 rounded-lg text-white text-sm font-medium">
+                    Launch Full Experience →
+                  </div>
+                </div>
+              </motion.button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  ));
+
+  const Dashboard = React.memo(() => {
+    return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="bg-white shadow-sm border-b border-gray-200">
+        <div className="max-w-7xl mx-auto px-6 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-3">
+              <button
+                onClick={() => go('brandSelection')}
+                className="px-3 py-1 rounded-full bg-white border text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-300"
+                aria-label="Back to brands"
+              >
+                ← Back
+              </button>
+              <div className="text-3xl">{demoBrands[selectedBrand].logo}</div>
+              <div>
+                <h1 className="text-2xl font-bold text-gray-900">{demoBrands[selectedBrand].name}</h1>
+                <p className="text-sm text-gray-500 flex items-center">
+                  <MapPin className="w-3 h-3 mr-1" />
+                  {demoBrands[selectedBrand].location.city}
+                  {liveData.lastUpdated && (<><span className="mx-2">•</span><Clock className="w-3 h-3 mr-1" />{liveData.lastUpdated.toLocaleTimeString()}</>)}
+                </p>
+              </div>
+            </div>
+
+            {/* ==== PATCH J: DATE PICKER + SCENARIO ==== */}
+            <div className="flex items-center space-x-3">
+              <div className="px-3 py-2 rounded-full bg-white border">
+                <label className="text-sm mr-2">Demo Date</label>
+                <select
+                  className="text-sm bg-transparent focus:outline-none"
+                  value={selectedSimDate ?? ''}
+                  onChange={(e)=> setSelectedSimDate(e.target.value)}
+                >
+                  {(simCalendar[selectedBrand as BrandKey] ?? []).map((d)=>(
+                    <option key={d} value={d}>{new Date(d).toLocaleDateString()}</option>
+                  ))}
+                </select>
+              </div>
+
+              <button
+                onClick={()=> go('simulator')}
+                className="px-3 py-2 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-800 text-sm hover:bg-indigo-100"
+              >
+                Open Scenario Simulator
+              </button>
+
+              <div className="px-3 py-2 rounded-full bg-emerald-50 border border-emerald-200 flex items-center space-x-2">
+                <span className="text-sm text-emerald-900">Automation</span>
+                <label className="inline-flex items-center cursor-pointer">
+                  <input type="checkbox" checked={automationEnabled} onChange={(e)=> setAutomationEnabled(e.target.checked)} className="sr-only peer"/>
+                  <div className="w-10 h-5 bg-gray-200 rounded-full peer-checked:bg-emerald-500 relative after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:bg-white after:rounded-full peer-checked:after:translate-x-5 transition"></div>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-7xl mx-auto p-6">
+        {/* ==== PATCH P: NAV STRIP ==== */}
+        <div className="mb-6 flex flex-wrap gap-2">
+          <button onClick={()=> go('campaigns')} className="px-3 py-2 text-sm rounded-lg bg-white border hover:bg-gray-50">Campaigns</button>
+          <button onClick={()=> go('explorer')} className="px-3 py-2 text-sm rounded-lg bg-white border hover:bg-gray-50">Explorer</button>
+          <button onClick={()=> go('playbooks')} className="px-3 py-2 text-sm rounded-lg bg-white border hover:bg-gray-50">Playbooks</button>
+          <button onClick={()=> go('performance')} className="px-3 py-2 text-sm rounded-lg bg-white border hover:bg-gray-50">Performance</button>
+        </div>
+
+        {isInitializing && (
+          <div className="flex items-center justify-center h-96">
+            <div className="text-center">
+              <div className="w-20 h-20 bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full flex items-center justify-center mx-auto mb-6 shadow-2xl">
+                <Brain className="w-10 h-10 text-white animate-pulse" />
+              </div>
+              <h2 className="text-2xl font-semibold text-gray-900 mb-3">
+                Deploying Complete Platform
+              </h2>
+              <p className="text-gray-600 mb-4">{initializationStep}</p>
+              <div className="w-64 h-2 bg-gray-200 rounded-full mx-auto">
+                <div className="h-2 bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full animate-pulse w-3/4"></div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!isInitializing && liveData.weather && (
+          <>
+            {/* New Executive Dashboard */}
+            <ExecutiveDashboardClean 
+              brand={demoBrands[selectedBrand]}
+              predictions={liveData.predictions}
+              automationEnabled={automationEnabled}
+              weather={liveData.weather}
+              onTakeTour={() => setShowDemoTour(true)}
+              onNavigate={(view) => go(view as any)}
+            />
+
+            {/* Demo Tour */}
+            <DemoTour
+              isOpen={showDemoTour}
+              onClose={() => setShowDemoTour(false)}
+              onComplete={() => setShowDemoTour(false)}
+            />
+                <div className="flex items-center space-x-4">
+                  <div className="flex items-center justify-center w-16 h-16 bg-white/20 rounded-full backdrop-blur-sm">
+                    <Thermometer className="w-8 h-8" />
+                  </div>
+                  <div>
+                    <div className="text-3xl font-bold">
+                      {Math.round(liveData.weather.current.temperature)}°F
+                    </div>
+                    <div className="text-sm opacity-90">
+                      Feels like {Math.round(liveData.weather.current.feelsLike)}°F
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-2 gap-4 text-sm">
+                  <div className="flex items-center space-x-2">
+                    <Droplets className="w-4 h-4" />
+                    <span>{liveData.weather.current.humidity}% humidity</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Wind className="w-4 h-4" />
+                    <span>{liveData.weather.current.windSpeed} mph winds</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Sun className="w-4 h-4" />
+                    <span>UV {liveData.weather.current.uvIndex}</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Target className="w-4 h-4" />
+                    <span>{Math.round(liveData.weather.scientific.weatherScore)}% score</span>
+                  </div>
+                </div>
+                
+                <div className="text-right">
+                  <div className="text-lg font-semibold">
+                    {Math.round(liveData.weather.scientific.comfortIndex)}% Comfort
+                  </div>
+                  <div className="text-sm opacity-90">
+                    {liveData.weather.current.description}
+                  </div>
+                </div>
+              </div>
+              
+              <div className="text-xs opacity-75 mt-4 pt-4 border-t border-white/20">
+                Source: {liveData.weather.meta.source} • {liveData.weather.meta.durationMs} ms • 
+                Updated {liveData.lastUpdated?.toLocaleTimeString()}
+              </div>
+            </div>
+
+            {liveData.predictions && liveData.predictions.length > 0 && (
+              <div className="bg-white rounded-xl shadow-lg p-8 mb-8 border border-gray-100">
+                <div className="flex items-center justify-between mb-6">
+                  <div>
+                    <h2 className="text-2xl font-bold text-gray-900 flex items-center">
+                      <Brain className="w-6 h-6 text-purple-500 mr-3" />
+                      Complete Automation Engine
+                    </h2>
+                    <p className="text-gray-600">
+                      Weather + ad spend + promotions + campaigns integrated with LinUCB optimization
+                    </p>
+                  </div>
+                  <div className="text-right text-sm text-gray-500">
+                    <div>Status: {automationEnabled ? 'Auto-Applied' : 'Awaiting Approval'}</div>
+                    <div>Next refresh: 30 seconds</div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {liveData.predictions.map((prediction, index) => (
+                    <div key={index} className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-lg p-6 border border-blue-200">
+                      <div className="flex items-start justify-between mb-4">
+                        <div>
+                          <h3 className="text-lg font-semibold text-gray-900 capitalize mb-1">
+                            {prediction.category} Campaign Optimization
+                          </h3>
+                          <p className="text-sm text-gray-600 mb-3">{prediction.reasoning}</p>
+                        </div>
+                        <div className="px-3 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                          UCB: {prediction.ucbScore.toFixed(3)}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-4 mb-4">
+                        <div className="text-center">
+                          <div className="text-2xl font-bold text-blue-600">
+                            {prediction.budgetMultiplier}x
+                          </div>
+                          <div className="text-xs text-gray-500">Budget Multiplier</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-2xl font-bold text-green-600">
+                            {prediction.expectedLift}
+                          </div>
+                          <div className="text-xs text-gray-500">Expected Lift</div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between mb-4">
+                        <div className="text-xs text-gray-500">
+                          Products: {prediction.products.length}
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <div className="w-24 bg-gray-200 rounded-full h-2">
+                            <div 
+                              className="bg-gradient-to-r from-blue-500 to-indigo-500 h-2 rounded-full"
+                              style={{width: `${prediction.confidence * 100}%`}}
+                            ></div>
+                          </div>
+                          <span className="text-xs font-medium text-gray-700">
+                            {Math.round(prediction.confidence * 100)}%
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="mt-2 flex items-center justify-between">
+                        <div className="text-xs text-gray-600">
+                          {promos.length>0
+                            ? `Promo: ${promos[0].discountPct ?? ''}% active (factored)`
+                            : 'No active promo'} • 
+                          {campaigns.length>0 ? 'Campaign push accounted' : 'No campaign bias'} • 
+                          Ad spend optimized
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          {automationEnabled ? (
+                            <span className="px-2 py-1 text-[11px] rounded bg-emerald-100 text-emerald-800">Applied automatically</span>
+                          ) : (
+                            <>
+                              <button type="button" className="px-3 py-1 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-700">Apply</button>
+                              <button type="button" className="px-3 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200">Schedule</button>
+                              <button type="button" className="px-3 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200">Ignore</button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="mt-3">
+                        <button className="text-xs text-indigo-700 hover:underline" onClick={()=> setWhyOpen(whyOpen===index?null:index)}>
+                          {whyOpen===index ? 'Hide why this recommendation' : 'Why this recommendation?'}
+                        </button>
+                        {whyOpen===index && (
+                          <div className="mt-2 text-xs text-gray-700 bg-white rounded border border-blue-200 p-3">
+                            <div className="font-medium text-gray-900 mb-1">Explanation</div>
+                            <div className="mb-2">{prediction.reasoning}</div>
+                            <div className="text-gray-600">Confidence: {Math.round(prediction.confidence*100)}% • UCB {prediction.ucbScore.toFixed(2)}</div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Executive Insights & Optimization Suggestions */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
+              <div className="bg-white rounded-xl shadow-lg p-6 border border-gray-100">
+                <ExecutiveInsights 
+                  brand={demoBrands[selectedBrand]}
+                  weather={liveData.weather}
+                  predictions={liveData.predictions}
+                  automationEnabled={automationEnabled}
+                />
+              </div>
+              <div className="bg-white rounded-xl shadow-lg p-6 border border-gray-100">
+                <OptimizationSuggestions
+                  brand={demoBrands[selectedBrand]}
+                  weather={liveData.weather}
+                  predictions={liveData.predictions}
+                  onApplyOptimization={(opt: any) => {
+                    setAutomationLog(prev => [...prev, {
+                      time: new Date().toISOString(),
+                      msg: `Applied ${opt.action}: ${opt.description}`
+                    }]);
+                  }}
+                />
+              </div>
+            </div>
+
+            {automationLog.length>0 && (
+              <div className="bg-white rounded-xl shadow-lg p-6 border border-gray-100 mt-6" aria-live="polite">
+                <h3 className="text-lg font-semibold text-gray-900 mb-3">Recent Automation Activity</h3>
+                <ul className="space-y-2 text-sm text-gray-700">
+                  {automationLog.slice(0,6).map((e,i)=>(
+                    <li key={i} className="flex items-center">
+                      <span className="w-28 text-gray-500">{new Date(e.time).toLocaleTimeString()}</span>
+                      <span>{e.msg}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="fixed top-4 right-4 z-50 space-y-2">
+        {notifications.filter(n => !n.dismissed).map(notification => (
+          <div
+            key={notification.id}
+            className={`p-4 rounded-lg shadow-lg border backdrop-blur-sm transition-all duration-300 ${
+              notification.type === 'success' ? 'bg-green-50/90 border-green-200 text-green-800' :
+              notification.type === 'error' ? 'bg-red-50/90 border-red-200 text-red-800' :
+              'bg-blue-50/90 border-blue-200 text-blue-800'
+            }`}
+          >
+            <div className="flex items-start justify-between">
+              <p className="text-sm font-medium">{notification.message}</p>
+              <button
+                onClick={() => setNotifications(prev => prev.map(n => 
+                  n.id === notification.id ? { ...n, dismissed: true } : n
+                ))}
+                className="ml-4 text-gray-400 hover:text-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-300 rounded"
+                aria-label="Dismiss notification"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )});
+
+  // ==== PATCH P2: MAIN RENDER SWITCH (route-based + code-split views) ====
+  let content: React.ReactNode;
+  switch (currentView) {
+    case 'landing':      content = <PremiumLandingPage />; break;
+    case 'brandSelection':content = <BrandSelection />; break;
+    case 'dashboard':    content = <Dashboard />; break;
+    case 'simulator':    content = (
+      <Suspense fallback={<div className="p-6">Loading…</div>}>
+        <LazySimulator scenario={scenario} setScenario={setScenario} runDemoPipeline={runDemoPipeline} onBack={()=>go('dashboard')} />
+      </Suspense>
+    ); break;
+    case 'campaigns':    content = (
+      <Suspense fallback={<div className="p-6">Loading…</div>}>
+        <LazyCampaigns brand={demoBrands[selectedBrand]} brandKey={selectedBrand} campaigns={campaigns} setCampaigns={setCampaigns} weather={liveData.weather} onBack={()=>go('dashboard')} onApply={()=> runDemoPipeline()} />
+      </Suspense>
+    ); break;
+    case 'explorer':     content = (
+      <Suspense fallback={<div className="p-6">Loading…</div>}>
+        <LazyExplorer brand={demoBrands[selectedBrand]} predictions={liveData.predictions} onBack={()=>go('dashboard')} />
+      </Suspense>
+    ); break;
+    case 'playbooks':    content = (
+      <Suspense fallback={<div className="p-6">Loading…</div>}>
+        <LazyPlaybooks onBack={()=>go('dashboard')} />
+      </Suspense>
+    ); break;
+    case 'performance':  content = (
+      <Suspense fallback={<div className="p-6">Loading…</div>}>
+        <LazyPerformance actions30d={120 + Math.floor(rng()*40)} roasLiftPct={Math.round((0.15 + rng()*0.06)*100)} accuracyPct={Math.round((0.9 + rng()*0.05)*100)} onBack={()=>go('dashboard')} />
+      </Suspense>
+    ); break;
+    default:             content = <LandingPage />; break;
+  }
+
+  const commands: Command[] = [
+    { id: 'nav-dashboard', label: 'Go to Dashboard', hint: 'Navigate', action: () => go('dashboard') },
+    { id: 'nav-simulator', label: 'Open Scenario Simulator', hint: 'Navigate', action: () => go('simulator') },
+    { id: 'nav-campaigns', label: 'View Campaigns', hint: 'Navigate', action: () => go('campaigns') },
+    { id: 'nav-explorer', label: 'Open Explorer', hint: 'Navigate', action: () => go('explorer') },
+    { id: 'nav-playbooks', label: 'Open Playbooks', hint: 'Navigate', action: () => go('playbooks') },
+    { id: 'nav-performance', label: 'View Performance', hint: 'Navigate', action: () => go('performance') },
+    { id: 'action-toggle-automation', label: `${automationEnabled ? 'Disable' : 'Enable'} Automation`, hint: 'Toggle', action: () => setAutomationEnabled(v => !v) },
+    { id: 'action-run', label: 'Run Recommendation Pipeline', hint: 'Compute now', action: () => runDemoPipeline() },
+    { id: 'brand-norsari', label: 'Switch Brand → NorSari', action: () => { setSelectedBrand('norsari'); go('dashboard'); } },
+    { id: 'brand-patagonia', label: 'Switch Brand → Patagonia', action: () => { setSelectedBrand('patagonia'); go('dashboard'); } },
+    { id: 'brand-kingsford', label: 'Switch Brand → Kingsford', action: () => { setSelectedBrand('kingsford'); go('dashboard'); } },
+    { id: 'brand-canopy', label: 'Switch Brand → Canopy', action: () => { setSelectedBrand('canopy'); go('dashboard'); } },
+  ];
+
+  return (
+    <>
+      <AnimatePresence mode="wait">
+        <motion.div key={currentView} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.25 }}>
+          {content}
+        </motion.div>
+      </AnimatePresence>
+      <CommandPalette open={paletteOpen} onClose={()=> setPaletteOpen(false)} commands={commands} />
+    </>
+  );
+};
+
+export default WeatherIntelligencePlatform;

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "codex-weather-intel": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "codex -m gpt-5 -c model_reasoning_effort=high mcp"
+      ],
+      "env": {}
+    }
+  }
+}
